@@ -1,110 +1,102 @@
+import os
 import discord
-from discord.ext import commands
 import requests
+from discord.ext import commands
 from notion_client import Client
-from bs4 import BeautifulSoup
+from flask import Flask, request, redirect
 
 # Load environment variables
-import os
+NOTION_CLIENT_ID = os.getenv("NOTION_CLIENT_ID")
+NOTION_CLIENT_SECRET = os.getenv("NOTION_CLIENT_SECRET")
+NOTION_REDIRECT_URI = os.getenv("NOTION_REDIRECT_URI")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-# Initialize Notion client
-notion = Client(auth=NOTION_API_KEY)
-
-# Define bot with command prefix
+# Initialize Discord bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Predefined categories
-CATEGORIES = ["Tech", "Marketing", "E-commerce", "Design", "Business", "Health"]
+# Flask web server for OAuth callback
+app = Flask(__name__)
 
-# Function to fetch webpage content
-def fetch_page_content(url):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        title = soup.title.string if soup.title else "No Title Found"
-        paragraphs = soup.find_all("p")
-        content = " ".join([p.text for p in paragraphs[:5]])  # First 5 paragraphs
-        return title, content
-    except Exception as e:
-        return "Error fetching page", str(e)
+@app.route("/")
+def home():
+    return "DSGN Dock is running!"
 
-# Function to generate summary and category using DeepSeek
-def summarize_and_categorize(title, content):
-    prompt = f"""
-    Summarize this content in 1-2 sentences:
-    Title: {title}
-    Content: {content}
-    
-    Then, suggest a category from: {CATEGORIES}
-    Format: "Summary: <summary> | Category: <category>"
-    """
+# Step 1: Redirect user to Notion OAuth page
+@app.route("/login")
+def login():
+    notion_auth_url = (
+        f"https://api.notion.com/v1/oauth/authorize"
+        f"?client_id={NOTION_CLIENT_ID}"
+        f"&response_type=code"
+        f"&owner=user"
+        f"&redirect_uri={NOTION_REDIRECT_URI}"
+    )
+    return redirect(notion_auth_url)
 
-    url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
+# Step 2: Handle Notion OAuth callback
+@app.route("/callback")
+def callback():
+    code = request.args.get("code")
+    if not code:
+        return "Authorization failed", 400
+
+    # Exchange authorization code for access token
+    token_url = "https://api.notion.com/v1/oauth/token"
     payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": "You are an AI that summarizes web pages and categorizes them."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": NOTION_REDIRECT_URI,
+        "client_id": NOTION_CLIENT_ID,
+        "client_secret": NOTION_CLIENT_SECRET
     }
-
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(token_url, data=payload)
     data = response.json()
 
-    if "choices" in data:
-        output = data["choices"][0]["message"]["content"]
-        summary, category = output.split("| Category: ")
-        return summary.strip(), category.strip()
-    else:
-        return "Failed to generate summary", "Unknown"
+    access_token = data.get("access_token")
+    if not access_token:
+        return "Failed to retrieve access token", 400
 
-# Function to add data to Notion
-def add_to_notion(url, title, summary, category):
-    try:
-        notion.pages.create(
-            parent={"database_id": NOTION_DATABASE_ID},
-            properties={
-                "Title": {"title": [{"text": {"content": title}}]},
-                "URL": {"url": url},
-                "Summary": {"rich_text": [{"text": {"content": summary}}]},
-                "Category": {"select": {"name": category}},
-            },
-        )
-        return True
-    except Exception as e:
-        return str(e)
+    return f"Authorization successful! Your Notion access token: {access_token}"
 
-# Discord command to save a link
+# Function to save a URL to Notion using OAuth access token
+def add_to_notion(url, access_token):
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    notion_database_id = os.getenv("NOTION_DATABASE_ID")
+    data = {
+        "parent": {"database_id": notion_database_id},
+        "properties": {
+            "URL": {"title": [{"text": {"content": url}}]}
+        }
+    }
+    response = requests.post("https://api.notion.com/v1/pages", headers=headers, json=data)
+    return response.json()
+
+# Discord command to save a URL
 @bot.command()
 async def save(ctx, url: str):
     await ctx.send("🔄 Processing...")
 
-    # Fetch page content
-    title, content = fetch_page_content(url)
+    # Temporary access token (OAuth flow required)
+    access_token = "your-temporary-access-token"  # Replace with actual OAuth flow retrieval
 
-    # Generate summary and category
-    summary, category = summarize_and_categorize(title, content)
-
-    # Save to Notion
-    success = add_to_notion(url, title, summary, category)
-
-    if success == True:
-        await ctx.send(f"✅ Saved to Notion!\n**Title:** {title}\n**Summary:** {summary}\n**Category:** {category}")
+    result = add_to_notion(url, access_token)
+    if "id" in result:
+        await ctx.send(f"✅ Saved to Notion: {url}")
     else:
-        await ctx.send(f"❌ Failed to save to Notion: {success}")
+        await ctx.send(f"❌ Failed to save: {result}")
 
-# Run the bot
-bot.run(DISCORD_BOT_TOKEN)
+# Run both Flask and Discord bot
+if __name__ == "__main__":
+    import threading
+    def run_flask():
+        app.run(host="0.0.0.0", port=3000)
+    
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    bot.run(DISCORD_BOT_TOKEN)
